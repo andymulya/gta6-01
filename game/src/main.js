@@ -1,17 +1,23 @@
 // Boot and the one loop: input is read every frame, the world advances in fixed
 // 1/60 s steps (several in a slow frame, none in a fast one), and the renderer
 // paints what is there. The game moves between five screens: title, play, paused,
-// game over and win.
+// game over and win. Progress saves to localStorage (Q quick-save, auto-save on
+// delivery, C continues from the title when a save exists).
 //
 // ?seed=N fixes the city and the traffic pattern. ?shot=cover|drive|chase|heist
 // (with &seed=N) stages that scene instead of running the loop, paints it twice
 // and sets window.__shotReady for a screenshot.
-import { BEST_KEY, STEP } from './config.js';
+import { BEST_KEY, SAVE_KEY, STEP, VIEW } from './config.js';
 import { createRandom } from './random.js';
 import {
-  createWorld, EVENT_BUSTED, EVENT_DELIVER, EVENT_HIT, EVENT_PICKUP, EVENT_WIN, EVENT_WRECKED,
+  createWorld, EVENT_BUSTED, EVENT_DELIVER, EVENT_HIT, EVENT_PICKUP, EVENT_SAVE,
+  EVENT_SHOOT, EVENT_WIN, EVENT_WRECKED,
 } from './world.js';
-import { ACTION_CONFIRM, ACTION_ENTER, ACTION_PAUSE, createInput } from './input.js';
+import {
+  ACTION_BUY_AMMO, ACTION_BUY_ARMOR, ACTION_BUY_ENGINE, ACTION_BUY_SMG, ACTION_BUY_TIRES,
+  ACTION_CONFIRM, ACTION_CONTINUE, ACTION_ENTER, ACTION_PAUSE, ACTION_RADIO, ACTION_SAVE,
+  createInput,
+} from './input.js';
 import {
   createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN,
 } from './render.js';
@@ -32,7 +38,7 @@ const world = createWorld(createRandom(seed));
 const renderer = createRenderer(canvas);
 const audio = createAudio();
 
-const NO_INPUT = { up: false, down: false, left: false, right: false, handbrake: false, action: false };
+const NO_INPUT = { up: false, down: false, left: false, right: false, handbrake: false, action: false, shoot: false, aimAngle: null };
 
 function readBest() {
   try {
@@ -50,11 +56,30 @@ function saveBest(value) {
   }
 }
 
+function readSave() {
+  try {
+    const raw = window.localStorage.getItem(SAVE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeSave() {
+  try {
+    window.localStorage.setItem(SAVE_KEY, JSON.stringify(world.saveData()));
+    world.state.saveFlash = 2;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function runShot(name) {
   const scene = stageShot(name, world);
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
+    renderer.draw(world.state, scene.screen, scene.best, false);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -66,6 +91,7 @@ function runGame() {
   const input = createInput(canvas);
   let screen = SCREEN_TITLE;
   let best = readBest();
+  let saveExists = readSave() !== null;
   let accumulator = 0;
   let last = performance.now();
 
@@ -74,12 +100,35 @@ function runGame() {
     status.textContent = message;
   }
 
+  /** Mouse position in world coordinates, for aiming the gun on foot. */
+  function aimAngle() {
+    const held = input.state();
+    const scale = Math.min(canvas.clientWidth / VIEW.width, canvas.clientHeight / VIEW.height);
+    const offX = (canvas.clientWidth - VIEW.width * scale) / 2;
+    const offY = (canvas.clientHeight - VIEW.height * scale) / 2;
+    const wx = world.state.camera.x + (held.mouseX - offX) / scale;
+    const wy = world.state.camera.y + (held.mouseY - offY) / scale;
+    const p = world.state.player;
+    return Math.atan2(wy - p.y, wx - p.x);
+  }
+
   function startGame() {
     audio.unlock();
     world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    announce('Playing. Five jobs. Get the package, lose the cops, deliver.');
+    announce('Playing. Ten jobs. Get the package, lose the cops, deliver.');
+  }
+
+  function continueGame() {
+    const data = readSave();
+    if (!data) { startGame(); return; }
+    audio.unlock();
+    world.reset();
+    world.applySave(data);
+    accumulator = 0;
+    screen = SCREEN_PLAY;
+    announce('Continued your run. Ten jobs. Get the package, lose the cops, deliver.');
   }
 
   function endGame(won) {
@@ -92,7 +141,9 @@ function runGame() {
   }
 
   function handleActions(actions) {
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WIN)) {
+    if (actions & ACTION_CONTINUE && screen === SCREEN_TITLE && saveExists) {
+      continueGame();
+    } else if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WIN)) {
       startGame();
     } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -101,6 +152,21 @@ function runGame() {
       screen = SCREEN_PLAY;
       announce('Playing.');
     }
+    if (screen !== SCREEN_PLAY) return;
+    if (actions & ACTION_RADIO) {
+      const station = world.cycleRadio();
+      audio.setStation(station);
+      announce(`Radio station ${station + 1}.`);
+    }
+    if (actions & ACTION_SAVE) {
+      writeSave();
+      announce('Progress saved.');
+    }
+    if (actions & ACTION_BUY_ENGINE) world.buyUpgrade('engine');
+    if (actions & ACTION_BUY_ARMOR) world.buyUpgrade('armor');
+    if (actions & ACTION_BUY_TIRES) world.buyUpgrade('tires');
+    if (actions & ACTION_BUY_SMG) world.buyWeapon();
+    if (actions & ACTION_BUY_AMMO) world.buyAmmo();
   }
 
   function step(actions) {
@@ -118,11 +184,15 @@ function runGame() {
       right: held.right,
       handbrake: held.handbrake,
       action: Boolean(actions & ACTION_ENTER),
+      shoot: held.mouseDown && !world.state.player.inCar,
+      aimAngle: world.state.player.inCar ? null : aimAngle(),
     };
     const events = world.step(STEP, stepInput);
     if (events & EVENT_PICKUP) audio.pickup();
     if (events & EVENT_DELIVER) audio.deliver();
     if (events & EVENT_HIT) audio.crash();
+    if (events & EVENT_SHOOT) audio.shoot();
+    if (events & EVENT_SAVE) writeSave();
     if (events & EVENT_BUSTED) {
       audio.busted();
       endGame(false);
@@ -153,7 +223,7 @@ function runGame() {
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best);
+    renderer.draw(world.state, screen, best, saveExists);
   }
 
   // Leaving the tab pauses a running game rather than letting the cops close in unseen.
@@ -164,7 +234,10 @@ function runGame() {
     }
   });
 
-  announce('Vice Bay. Press Enter or click to start.');
+  // Read-only handle for automated playtests (no gameplay effect).
+  window.__viceBay = { world, getScreen: () => screen };
+
+  announce('Vice Bay II. Press Enter or click to start.');
   requestAnimationFrame(frame);
 }
 

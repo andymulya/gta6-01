@@ -1,11 +1,15 @@
-// Vice Bay rules and state, with no drawing and no browser in it: the player's
-// car and on-foot body, cop cars, traffic, pedestrians, the city, the five jobs,
-// the wanted level, cash and the camera. step() advances one fixed step and
-// returns what happened as bit flags, so the caller can react without the world
-// knowing about screens or sound. Nothing here allocates after createWorld returns.
+// Vice Bay II rules and state, with no drawing and no browser in it: the player's
+// car and on-foot body, cop cars, the police helicopter, roadblocks, gang
+// shooters, traffic, pedestrians, the city, the ten jobs, the wanted level,
+// cash, respect, weapons, upgrades and the camera. step() advances one fixed
+// step and returns what happened as bit flags, so the caller can react without
+// the world knowing about screens or sound. Nothing here allocates after
+// createWorld returns (bullets and gang shooters reuse fixed pools).
 import {
-  BEACH_Y, CAR, CAR_STEAL_WANTED, COP, COPS_PER_STAR, GARAGE_REPAIR_COST, JOB_COUNT, JOB_TIME,
-  PEDS, PLAYER_FOOT, ROADS_X, ROADS_Y, ROAD_W, STEP, TRAFFIC, WANTED_MAX, WORLD,
+  AMMO_COST, AMMO_PACK, BEACH_Y, CAR, CAR_STEAL_WANTED, COP, COPS_PER_STAR, GARAGE_REPAIR_COST,
+  HELI, JOB_COUNT, JOB_TIME, PEDS, PLAYER_FOOT, ROADS_X, ROADS_Y, ROAD_W, SMG_COST, START_AMMO,
+  STEP, TRAFFIC, UPGRADES, WANTED_MAX, WEAPONS, WORLD, carGrip, carMaxHealth, carMaxSpeed,
+  upgradeCost,
 } from './config.js';
 import { createCity, insideBuilding, onRoad, resolveBuildings } from './city.js';
 import { JOBS } from './missions.js';
@@ -18,6 +22,9 @@ export const EVENT_WIN = 16;
 export const EVENT_HIT = 32;
 export const EVENT_JOB = 64;
 export const EVENT_STEAL = 128;
+export const EVENT_SHOOT = 256;
+export const EVENT_KILL = 512;
+export const EVENT_SAVE = 1024;
 
 const TAU = Math.PI * 2;
 
@@ -29,7 +36,7 @@ function angleDiff(a, b) {
 }
 
 function clamp(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
+  return v < lo ? lo : v < hi ? v : hi;
 }
 
 function dist(ax, ay, bx, by) {
@@ -66,6 +73,21 @@ export function createWorld(random) {
   for (let i = 0; i < PEDS.count; i += 1) {
     peds.push({ active: false, x: 0, y: 0, angle: 0, speed: 0, down: 0, scatter: 0, radius: PEDS.radius });
   }
+  // Gang shooters guarding two pickups (fixed pool, reused per job).
+  const gang = [];
+  for (let i = 0; i < 3; i += 1) {
+    gang.push({ active: false, x: 0, y: 0, angle: 0, health: 3, shootTimer: 1, radius: 12 });
+  }
+  // Bullets, player and gang alike (fixed pool).
+  const bullets = [];
+  for (let i = 0; i < 24; i += 1) {
+    bullets.push({ active: false, x: 0, y: 0, vx: 0, vy: 0, life: 0, fromGang: false });
+  }
+  // Roadblock cars (fixed pool of two).
+  const roadblocks = [];
+  for (let i = 0; i < 2; i += 1) {
+    roadblocks.push({ active: false, x: 0, y: 0, angle: 0, radius: 16, vx: 0, vy: 0 });
+  }
 
   const state = {
     city,
@@ -74,9 +96,14 @@ export function createWorld(random) {
     cops,
     traffic,
     peds,
+    gang,
+    bullets,
+    roadblocks,
+    heli: { active: false, x: 0, y: 0, angle: 0, rotor: 0, locked: false },
     wanted: 0,
     unseenTimer: 0,
     cash: 0,
+    respect: 0,
     jobIndex: 0,
     jobStage: 'pickup', // 'pickup' | 'deliver' | 'done'
     jobTimer: JOB_TIME,
@@ -88,6 +115,18 @@ export function createWorld(random) {
     busted: false,
     wrecked: false,
     won: false,
+    // v5: combat, upgrades, radio, save.
+    weapon: 'pistol',
+    ammo: START_AMMO,
+    playerHealth: PLAYER_FOOT.health,
+    upgrades: { engine: 0, armor: 0, tires: 0 },
+    radio: 0,
+    fireTimer: 0,
+    muzzle: 0,
+    saveFlash: 0,
+    lastHurt: -99,
+    roadblockTimer: 0,
+    heatWarnTimer: 0,
   };
 
   function spawnTrafficCar(t) {
@@ -156,10 +195,44 @@ export function createWorld(random) {
     c.active = true;
   }
 
+  function spawnGang(job) {
+    // Three shooters in a loose ring around the pickup.
+    for (let i = 0; i < gang.length; i += 1) {
+      const g = gang[i];
+      const a = (i / gang.length) * TAU + 0.5;
+      g.x = job.pickup.x + Math.cos(a) * 110;
+      g.y = job.pickup.y + Math.sin(a) * 110;
+      if (insideBuilding(city, g.x, g.y)) { g.x = job.pickup.x + Math.cos(a) * 70; g.y = job.pickup.y + Math.sin(a) * 70; }
+      g.angle = Math.atan2(player.y - g.y, player.x - g.x);
+      g.health = 3;
+      g.shootTimer = 0.8 + i * 0.5;
+      g.active = true;
+    }
+  }
+
+  function fireBullet(x, y, angle, fromGang) {
+    for (const b of bullets) {
+      if (b.active) continue;
+      const speed = fromGang ? 380 : WEAPONS[state.weapon].bulletSpeed;
+      const spread = fromGang ? 0.08 : WEAPONS[state.weapon].spread;
+      const a = angle + (random() - 0.5) * 2 * spread;
+      b.x = x + Math.cos(angle) * 20;
+      b.y = y + Math.sin(angle) * 20;
+      b.vx = Math.cos(a) * speed;
+      b.vy = Math.sin(a) * speed;
+      b.life = 1.1;
+      b.fromGang = fromGang;
+      b.active = true;
+      return true;
+    }
+    return false;
+  }
+
   function reset() {
     state.wanted = 0;
     state.unseenTimer = 0;
     state.cash = 0;
+    state.respect = 0;
     state.jobIndex = 0;
     state.jobStage = 'pickup';
     state.jobTimer = JOB_TIME;
@@ -168,6 +241,22 @@ export function createWorld(random) {
     state.busted = false;
     state.wrecked = false;
     state.won = false;
+    state.weapon = 'pistol';
+    state.ammo = START_AMMO;
+    state.playerHealth = PLAYER_FOOT.health;
+    state.upgrades = { engine: 0, armor: 0, tires: 0 };
+    state.radio = 0;
+    state.fireTimer = 0;
+    state.muzzle = 0;
+    state.saveFlash = 0;
+    state.lastHurt = -99;
+    state.roadblockTimer = 0;
+    state.heatWarnTimer = 0;
+    state.heli.active = false;
+    state.heli.locked = false;
+    for (const g of gang) g.active = false;
+    for (const b of bullets) b.active = false;
+    for (const r of roadblocks) r.active = false;
     state.message = JOBS[0].fixer;
     state.messageTimer = 6;
     playerCar.x = city.locations.safehouse.x;
@@ -175,7 +264,7 @@ export function createWorld(random) {
     playerCar.angle = Math.PI / 2;
     playerCar.vx = 0;
     playerCar.vy = 0;
-    playerCar.health = CAR.health;
+    playerCar.health = carMaxHealth(state.upgrades);
     player.x = playerCar.x;
     player.y = playerCar.y;
     player.angle = -Math.PI / 2;
@@ -276,6 +365,12 @@ export function createWorld(random) {
     return playerCar.health <= 0;
   }
 
+  function hurtPlayer(amount) {
+    state.playerHealth = Math.max(0, state.playerHealth - amount);
+    state.lastHurt = state.elapsed;
+    return state.playerHealth <= 0;
+  }
+
   function setMessage(text, seconds) {
     state.message = text;
     state.messageTimer = seconds;
@@ -288,24 +383,112 @@ export function createWorld(random) {
   function startJob(index) {
     state.jobIndex = index;
     state.jobStage = 'pickup';
-    state.jobTimer = JOB_TIME;
+    state.jobTimer = JOBS[index].time ?? JOB_TIME;
     state.hasPackage = false;
-    setMessage(JOBS[index].fixer, 6);
+    for (const g of gang) g.active = false;
+    if (JOBS[index].guarded) spawnGang(JOBS[index]);
+    if (JOBS[index].heatStart) {
+      state.wanted = Math.min(WANTED_MAX, JOBS[index].heatStart);
+      setMessage(`${JOBS[index].fixer} Lose the heat first!`, 6);
+    } else {
+      setMessage(JOBS[index].fixer, 6);
+    }
+  }
+
+  /** Buy one garage upgrade level; returns true when the purchase landed. */
+  function buyUpgrade(kind) {
+    const level = state.upgrades[kind];
+    if (level === undefined || level >= UPGRADES[kind].max) return false;
+    const cost = upgradeCost(kind, level);
+    if (state.cash < cost) return false;
+    state.cash -= cost;
+    state.upgrades[kind] = level + 1;
+    if (kind === 'armor') playerCar.health = carMaxHealth(state.upgrades);
+    setMessage(`${UPGRADES[kind].name} upgraded to Lv${level + 1}. -$${cost}.`, 4);
+    return true;
+  }
+
+  function buyWeapon() {
+    if (state.weapon === 'smg') return false;
+    if (state.cash < SMG_COST) return false;
+    state.cash -= SMG_COST;
+    state.weapon = 'smg';
+    state.ammo += 120;
+    setMessage(`SMG bought. +120 ammo. -$${SMG_COST}.`, 4);
+    return true;
+  }
+
+  function buyAmmo() {
+    if (state.cash < AMMO_COST) return false;
+    state.cash -= AMMO_COST;
+    state.ammo += AMMO_PACK;
+    setMessage(`Ammo +${AMMO_PACK}. -$${AMMO_COST}.`, 3);
+    return true;
+  }
+
+  function cycleRadio() {
+    state.radio = (state.radio + 1) % 3;
+    return state.radio;
+  }
+
+  /** Plain-data snapshot for localStorage saves. */
+  function saveData() {
+    return {
+      cash: state.cash,
+      jobIndex: state.jobIndex,
+      upgrades: { ...state.upgrades },
+      respect: state.respect,
+      weapon: state.weapon,
+      ammo: state.ammo,
+      best: Math.max(0, state.cash),
+    };
+  }
+
+  /** Restore a save snapshot (after reset): job, cash, upgrades, respect, gear. */
+  function applySave(data) {
+    if (!data || typeof data !== 'object') return false;
+    state.cash = Number(data.cash) || 0;
+    state.respect = Number(data.respect) || 0;
+    state.weapon = data.weapon === 'smg' ? 'smg' : 'pistol';
+    state.ammo = Number(data.ammo) || START_AMMO;
+    if (data.upgrades) {
+      for (const k of ['engine', 'armor', 'tires']) {
+        state.upgrades[k] = Math.max(0, Math.min(3, Number(data.upgrades[k]) || 0));
+      }
+    }
+    playerCar.health = carMaxHealth(state.upgrades);
+    const index = Math.max(0, Math.min(JOB_COUNT - 1, Number(data.jobIndex) || 0));
+    state.jobIndex = index;
+    state.jobStage = 'pickup';
+    state.jobTimer = JOBS[index].time ?? JOB_TIME;
+    state.hasPackage = false;
+    for (const g of gang) g.active = false;
+    if (JOBS[index].guarded) spawnGang(JOBS[index]);
+    setMessage(`Back in Vice Bay. ${JOBS[index].name} — pick up the package.`, 5);
+    return true;
   }
 
   function step(dt, input) {
     let events = 0;
     state.elapsed += dt;
     if (state.messageTimer > 0) state.messageTimer -= dt;
+    if (state.muzzle > 0) state.muzzle -= dt;
+    if (state.saveFlash > 0) state.saveFlash -= dt;
+    if (state.fireTimer > 0) state.fireTimer -= dt;
+    if (state.heatWarnTimer > 0) state.heatWarnTimer -= dt;
 
     const job = currentJob();
+    const maxHealth = carMaxHealth(state.upgrades);
 
     // --- Player: drive, walk, enter/exit, steal, repair ---
     if (player.inCar) {
       const steer = (input.right ? 1 : 0) - (input.left ? 1 : 0);
       const throttle = (input.up ? 1 : 0) - (input.down ? 1 : 0);
       const speedBefore = Math.hypot(playerCar.vx, playerCar.vy);
-      stepCarBody(playerCar, dt, steer, throttle, input.handbrake, { accel: CAR.accel, drag: CAR.drag, turnRate: CAR.turnRate, grip: CAR.grip, maxSpeed: CAR.maxSpeed });
+      stepCarBody(playerCar, dt, steer, throttle, input.handbrake, {
+        accel: CAR.accel, drag: CAR.drag, turnRate: CAR.turnRate,
+        grip: carGrip(state.upgrades), maxSpeed: carMaxSpeed(state.upgrades),
+      });
       if (resolveBuildings(city, playerCar)) {
         const impact = speedBefore;
         if (impact > 220) {
@@ -325,6 +508,12 @@ export function createWorld(random) {
         const rel = collideCars(playerCar, c, (d) => { if (damagePlayer(d)) { state.wrecked = true; events |= EVENT_WRECKED; } }, null);
         if (rel > 200) events |= EVENT_HIT;
       }
+      // Roadblocks are parked: hitting one hurts.
+      for (const r of roadblocks) {
+        if (!r.active) continue;
+        const rel = collideCars(playerCar, r, (d) => { if (damagePlayer(d)) { state.wrecked = true; events |= EVENT_WRECKED; } }, null);
+        if (rel > 160) events |= EVENT_HIT;
+      }
       // Exit the car.
       if (input.action) {
         player.inCar = false;
@@ -335,11 +524,17 @@ export function createWorld(random) {
       }
       // Garage repair (press E near the garage while stopped-ish).
       const g = city.locations.garage;
-      if (input.action && dist(playerCar.x, playerCar.y, g.x, g.y) < 110 && playerCar.health < CAR.health && state.cash >= GARAGE_REPAIR_COST) {
-        playerCar.health = CAR.health;
+      if (input.action && dist(playerCar.x, playerCar.y, g.x, g.y) < 110 && playerCar.health < maxHealth && state.cash >= GARAGE_REPAIR_COST) {
+        playerCar.health = maxHealth;
         state.cash -= GARAGE_REPAIR_COST;
         state.wanted = Math.max(0, state.wanted - 2);
         setMessage('Garage: car repaired, heat dropped. -$200.', 4);
+      }
+      // Safehouse: park here and the heat melts away while the car heals free.
+      const sh = city.locations.safehouse;
+      if (dist(playerCar.x, playerCar.y, sh.x, sh.y) < 130) {
+        if (playerCar.health < maxHealth) playerCar.health = Math.min(maxHealth, playerCar.health + 3 * dt);
+        state.unseenTimer += dt * 2;
       }
     } else {
       // On foot: walk with the same keys.
@@ -354,15 +549,38 @@ export function createWorld(random) {
       player.x = clamp(player.x, 16, WORLD.width - 16);
       player.y = clamp(player.y, 16, WORLD.height - 16);
       resolveBuildings(city, player);
+      // Aim where the mouse points; click to shoot.
+      if (input.aimAngle !== undefined && input.aimAngle !== null) {
+        player.angle = input.aimAngle;
+      }
+      if (input.shoot && state.fireTimer <= 0 && state.ammo > 0) {
+        if (fireBullet(player.x, player.y, player.angle, false)) {
+          state.ammo -= 1;
+          state.fireTimer = WEAPONS[state.weapon].fireRate;
+          state.muzzle = 0.12;
+          events |= EVENT_SHOOT;
+        }
+      }
+      // Slow health regen when out of trouble for a while.
+      if (state.elapsed - state.lastHurt > 6 && state.playerHealth < PLAYER_FOOT.health) {
+        state.playerHealth = Math.min(PLAYER_FOOT.health, state.playerHealth + 3 * dt);
+      }
       // Pick up the package on foot.
       if (state.jobStage === 'pickup' && !state.hasPackage && dist(player.x, player.y, job.pickup.x, job.pickup.y) < 52) {
-        state.hasPackage = true;
-        state.jobStage = 'deliver';
-        setMessage('Package grabbed. Get to the drop-off — fast.', 4);
-        events |= EVENT_PICKUP;
-        // A cop watching the grab adds heat.
-        for (const c of cops) {
-          if (c.active && c.seen) { state.wanted = Math.min(WANTED_MAX, state.wanted + 1); break; }
+        if (job.heatStart && state.wanted > 0) {
+          if (state.heatWarnTimer <= 0) {
+            setMessage('Too hot! Lose the heat first, then grab it.', 3);
+            state.heatWarnTimer = 3;
+          }
+        } else {
+          state.hasPackage = true;
+          state.jobStage = 'deliver';
+          setMessage('Package grabbed. Get to the drop-off — fast.', 4);
+          events |= EVENT_PICKUP;
+          // A cop watching the grab adds heat.
+          for (const c of cops) {
+            if (c.active && c.seen) { state.wanted = Math.min(WANTED_MAX, state.wanted + 1); break; }
+          }
         }
       }
       // Re-enter the player's car, or steal a traffic car.
@@ -378,7 +596,7 @@ export function createWorld(random) {
               playerCar.angle = t.angle;
               playerCar.vx = Math.cos(t.angle) * t.speed;
               playerCar.vy = Math.sin(t.angle) * t.speed;
-              playerCar.health = CAR.health;
+              playerCar.health = maxHealth;
               player.inCar = true;
               state.wanted = Math.min(WANTED_MAX, state.wanted + CAR_STEAL_WANTED);
               setMessage('Car stolen. The cops noticed.', 4);
@@ -386,6 +604,53 @@ export function createWorld(random) {
               break;
             }
           }
+        }
+      }
+    }
+
+    // --- Bullets: fly, hit buildings, gang, or the player ---
+    for (const b of bullets) {
+      if (!b.active) continue;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.life -= dt;
+      if (b.life <= 0 || b.x < 0 || b.x > WORLD.width || b.y < 0 || b.y > WORLD.height || insideBuilding(city, b.x, b.y)) {
+        b.active = false;
+        continue;
+      }
+      if (!b.fromGang) {
+        for (const g of gang) {
+          if (g.active && dist(b.x, b.y, g.x, g.y) < g.radius + 4) {
+            g.health -= WEAPONS[state.weapon].damage;
+            b.active = false;
+            if (g.health <= 0) {
+              g.active = false;
+              state.respect += 2;
+              events |= EVENT_KILL;
+              setMessage('Gang shooter down. +2 respect.', 2);
+            }
+            break;
+          }
+        }
+      } else if (!player.inCar && dist(b.x, b.y, player.x, player.y) < player.radius + 4) {
+        b.active = false;
+        if (hurtPlayer(8)) {
+          state.busted = true;
+          events |= EVENT_BUSTED;
+        }
+      }
+    }
+
+    // --- Gang shooters: stand their ground, shoot at the player on foot ---
+    for (const g of gang) {
+      if (!g.active) continue;
+      g.shootTimer -= dt;
+      const d = dist(g.x, g.y, player.x, player.y);
+      if (!player.inCar && d < 460) {
+        g.angle = Math.atan2(player.y - g.y, player.x - g.x);
+        if (g.shootTimer <= 0 && lineOfSight(city, g.x, g.y, player.x, player.y)) {
+          fireBullet(g.x, g.y, g.angle, true);
+          g.shootTimer = 1.5 + random() * 0.6;
         }
       }
     }
@@ -398,8 +663,11 @@ export function createWorld(random) {
         const late = state.jobTimer <= 0;
         const pay = late ? Math.floor(job.pay / 2) : job.pay + Math.floor(state.jobTimer * 4);
         state.cash += pay;
+        state.respect += 10;
         state.hasPackage = false;
         events |= EVENT_DELIVER;
+        events |= EVENT_SAVE;
+        state.saveFlash = 2;
         state.wanted = Math.max(0, state.wanted - 1);
         if (state.jobIndex + 1 >= JOB_COUNT) {
           state.jobStage = 'done';
@@ -408,7 +676,7 @@ export function createWorld(random) {
           setMessage(`Delivered! +$${pay}. That was the last job — you own this city.`, 8);
         } else {
           startJob(state.jobIndex + 1);
-          setMessage(`Delivered! +$${pay}. ${JOBS[state.jobIndex].name}`, 5);
+          setMessage(`Delivered! +$${pay} · +10 respect. ${JOBS[state.jobIndex].name}`, 5);
         }
       }
     }
@@ -419,7 +687,7 @@ export function createWorld(random) {
         // Deadline missed: the package is lost, the job restarts.
         state.hasPackage = false;
         state.jobStage = 'pickup';
-        state.jobTimer = JOB_TIME;
+        state.jobTimer = JOBS[state.jobIndex].time ?? JOB_TIME;
         setMessage('Too slow — the buyer walked. The fixer re-lists the job.', 5);
       }
     }
@@ -459,6 +727,64 @@ export function createWorld(random) {
         if (o !== c && o.active) collideCars(c, o, null, null);
       }
     }
+
+    // --- Helicopter at 4–5 stars: follows, spotlight, keeps you seen ---
+    const heli = state.heli;
+    if (state.wanted >= 4 || heli.locked) {
+      if (!heli.active) {
+        heli.active = true;
+        heli.x = px;
+        heli.y = py - 260;
+        heli.angle = 0;
+      }
+      // It hovers off to the side of the player (never exactly on top of the
+      // car), spotlight on them. A locked heli (screenshot staging) stays put.
+      const tx = heli.locked ? heli.x : px - 130;
+      const ty = heli.locked ? heli.y : py - 130;
+      const want = Math.atan2(ty - heli.y, tx - heli.x);
+      heli.angle = want;
+      const hd = dist(heli.x, heli.y, tx, ty);
+      const hSpeed = Math.min(HELI.speed, hd * 1.2);
+      heli.x += Math.cos(want) * hSpeed * dt;
+      heli.y += Math.sin(want) * hSpeed * dt;
+      heli.rotor += dt * 28;
+      if (dist(heli.x, heli.y, px, py) < HELI.sightRange) anyoneSees = true; // spotlight: no hiding while it is overhead
+    } else if (heli.active) {
+      heli.active = false;
+    }
+
+    // --- Roadblocks at 3+ stars: two parked cop cars across the road ahead ---
+    if (state.wanted >= 3) {
+      state.roadblockTimer -= dt;
+      if (state.roadblockTimer <= 0) {
+        state.roadblockTimer = 2;
+        // Ahead of the player, on the nearest road in the direction of travel.
+        const heading = player.inCar ? playerCar.angle : player.angle;
+        const ax = px + Math.cos(heading) * 420;
+        const ay = py + Math.sin(heading) * 420;
+        const onVertical = Math.abs(Math.cos(heading)) < Math.abs(Math.sin(heading));
+        let bx;
+        let by;
+        if (onVertical) {
+          bx = ROADS_X.reduce((best, v) => (Math.abs(v - ax) < Math.abs(best - ax) ? v : best), ROADS_X[0]);
+          by = clamp(ay, 120, BEACH_Y - 120);
+        } else {
+          by = ROADS_Y.reduce((best, v) => (Math.abs(v - ay) < Math.abs(best - ay) ? v : best), ROADS_Y[0]);
+          bx = clamp(ax, 120, WORLD.width - 120);
+        }
+        const perp = onVertical ? 0 : Math.PI / 2;
+        for (let i = 0; i < 2; i += 1) {
+          const r = roadblocks[i];
+          r.active = true;
+          r.x = bx + Math.cos(perp) * (i === 0 ? -34 : 34);
+          r.y = by + Math.sin(perp) * (i === 0 ? -34 : 34);
+          r.angle = perp;
+        }
+      }
+    } else {
+      for (const r of roadblocks) r.active = false;
+    }
+
     if (anyoneSees) state.unseenTimer = 0;
     else if (state.wanted > 0) {
       // Heat only drops once the player is truly away: no cop close by and
@@ -590,5 +916,5 @@ export function createWorld(random) {
   }
 
   reset();
-  return { state, reset, step };
+  return { state, reset, step, startJob, buyUpgrade, buyWeapon, buyAmmo, cycleRadio, saveData, applySave };
 }

@@ -29,7 +29,7 @@ export function createCity(random) {
         parks.push({ x: x0, y: y0, width: w, height: h });
         continue;
       }
-      const kind = random() < 0.5 ? 'buildingA' : random() < 0.5 ? 'buildingB' : 'buildingC';
+      const kind = random() < 0.4 ? 'buildingA' : random() < 0.5 ? 'buildingB' : random() < 0.5 ? 'buildingC' : 'buildingD';
       const trim = trims[Math.floor(random() * trims.length)];
       if (w > 150 && h > 150 && random() < 0.5) {
         // Two buildings side by side with a gap between them.
@@ -48,8 +48,18 @@ export function createCity(random) {
     safehouse: { x: 320, y: 224 },
     garage: { x: 1920, y: 224 },
     pier: { x: 1280, y: 1696 },
+    weaponShop: { x: 960, y: 224 },
   };
-  return { buildings, parks, locations };
+  // Palm trees: a few per park, seeded positions so the same seed always
+  // grows the same palms.
+  const palms = [];
+  for (const p of parks) {
+    const n = 3 + Math.floor(random() * 4);
+    for (let i = 0; i < n; i += 1) {
+      palms.push({ x: p.x + 20 + random() * Math.max(1, p.width - 40), y: p.y + 20 + random() * Math.max(1, p.height - 40) });
+    }
+  }
+  return { buildings, parks, palms, locations };
 }
 
 /** True when the point is on a road (drivable for cars). */
