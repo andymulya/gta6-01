@@ -1,138 +1,139 @@
-// The screenshot scenes behind ?shot=cover|drive|chase|heist. Each one plays the
-// real rules forward from a fresh world, steered by a simple autopilot that drives
-// toward the current objective, so the frame is what a short game really looks
-// like and the same seed always gives the same frame.
+// The screenshot scenes behind ?shot=cover|drive|chase|heist. Each one stages a
+// real game state — a fresh world, a route for the autopilot to drive, cops where
+// the scene needs them — then plays the rules forward for a fixed number of
+// steps, so the frame is what the game really looks like and the same seed
+// always gives the same frame.
 import { STEP } from './config.js';
-import { SCREEN_PLAY } from './render.js';
+import { JOBS } from './missions.js';
+import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
 
-function normAngle(a) {
-  while (a > Math.PI) a -= Math.PI * 2;
-  while (a < -Math.PI) a += Math.PI * 2;
-  return a;
+const TAU = Math.PI * 2;
+
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= TAU;
+  while (d < -Math.PI) d += TAU;
+  return d;
 }
 
-function clamp(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
+function noInput() {
+  return { up: false, down: false, left: false, right: false, handbrake: false, action: false };
 }
 
-const IDLE = { move: { x: 0, y: 0 }, enter: false, punch: false, shoot: false, shootX: 0, shootY: 0, save: false };
-
-/** Input that walks the player toward (tx, ty). */
-function walkInput(state, tx, ty) {
-  const p = state.player;
-  const dx = tx - p.x;
-  const dy = ty - p.y;
-  const d = Math.hypot(dx, dy) || 1;
-  return { ...IDLE, move: { x: dx / d, y: dy / d } };
-}
-
-/** Input that drives the player's car toward (tx, ty). */
-function driveInput(state, tx, ty) {
-  const p = state.player;
-  const car = p.inCar;
-  if (!car) return walkInput(state, tx, ty);
+/** Steer the player's car toward a point; returns the input for this step. */
+function driveTo(state, tx, ty) {
+  const car = state.playerCar;
   const want = Math.atan2(ty - car.y, tx - car.x);
-  const err = normAngle(want - car.angle);
-  const steer = clamp(err * 2.2, -1, 1);
-  // Brake hard into a sharp turn: at full speed the turning circle is wider
-  // than the road, so a corner taken flat ends off-road against a building.
-  const throttle = Math.abs(err) < 0.5 ? 1 : Math.abs(err) < 1.0 ? 0.3 : -0.8;
-  return { ...IDLE, move: { x: steer, y: -throttle } };
+  const diff = angleDiff(want, car.angle);
+  const speed = Math.hypot(car.vx, car.vy);
+  const d = Math.hypot(tx - car.x, ty - car.y);
+  const input = noInput();
+  if (diff > 0.1) input.right = true;
+  else if (diff < -0.1) input.left = true;
+  input.up = d > 70;
+  if (Math.abs(diff) > 1.1 && speed > 220) {
+    input.up = false;
+    input.down = true;
+  }
+  return input;
 }
 
-/** Put the player inside a car (test scaffolding: the real game enters via E). */
-function seatPlayer(world, car) {
-  const p = world.state.player;
-  car.parked = false;
-  car.traffic = false;
-  p.inCar = car;
-  p.x = car.x;
-  p.y = car.y;
-  p.angle = car.angle;
+/** Follow a list of waypoints; returns the input for this step. */
+function followRoute(state, route, index) {
+  const target = route[Math.min(index.value, route.length - 1)];
+  const car = state.playerCar;
+  if (Math.hypot(target.x - car.x, target.y - car.y) < 90 && index.value < route.length - 1) {
+    index.value += 1;
+  }
+  return driveTo(state, route[Math.min(index.value, route.length - 1)].x, route[Math.min(index.value, route.length - 1)].y);
 }
 
-function firstCar(world) {
-  return world.state.cars.find((c) => c.parked) || world.state.cars[0];
+/** Walk the on-foot player toward a point. */
+function walkTo(state, tx, ty) {
+  const p = state.player;
+  const input = noInput();
+  if (tx > p.x + 6) input.right = true;
+  else if (tx < p.x - 6) input.left = true;
+  if (ty > p.y + 6) input.down = true;
+  else if (ty < p.y - 6) input.up = true;
+  return input;
 }
 
 /**
- * Set `world` to the named scene and return the screen to draw over it and the
- * best haul to show. Unknown names fall back to the cover scene.
+ * Set `world` to the named scene (cover, drive, chase, heist; any other name is
+ * cover) and return the screen to draw over it and the best cash to show.
  */
 export function stageShot(name, world) {
   const state = world.state;
-  if (name === 'drive') {
-    world.reset();
-    // Walk to the first car, steal it, drive south to the chop shop.
-    const car = firstCar(world);
-    for (let i = 0; i < 6 / STEP; i += 1) {
-      if (Math.hypot(state.player.x - car.x, state.player.y - car.y) < 46) break;
-      world.step(STEP, walkInput(state, car.x, car.y));
-    }
-    world.step(STEP, { ...IDLE, enter: true });
-    // 2.5 s of driving puts the car at the chop shop, not past it.
-    for (let i = 0; i < 2.5 / STEP; i += 1) {
-      world.step(STEP, driveInput(state, 700, 1000));
-    }
-    return { screen: SCREEN_PLAY, best: state.cash };
-  }
-  if (name === 'chase') {
-    world.reset();
-    world.startMission(2);
-    world.setWanted(4);
-    const car = firstCar(world);
-    car.x = 300;
-    car.y = 700;
-    car.angle = 0;
-    seatPlayer(world, car);
-    // 3 s east along the road, then coast to a stop; two cops are placed on
-    // the road behind the player so the pursuit is in the frame.
-    for (let i = 0; i < 3 / STEP; i += 1) {
-      world.step(STEP, driveInput(state, 2700, 700));
-    }
-    for (let i = 0; i < 1.5 / STEP; i += 1) {
-      world.step(STEP, IDLE);
-    }
-    const p = state.player;
-    world.placePolice(p.x - 220, p.y, 0);
-    world.placePolice(p.x - 380, p.y + 28, 0);
-    return { screen: SCREEN_PLAY, best: state.cash };
-  }
-  if (name === 'heist') {
-    world.reset();
-    world.startMission(4);
-    const car = firstCar(world);
-    car.x = 220;
-    car.y = 1100;
-    car.angle = 0;
-    seatPlayer(world, car);
-    for (let i = 0; i < 8 / STEP; i += 1) {
-      const truck = state.truck;
-      const target = truck ? { x: truck.x, y: truck.y } : { x: 2700, y: 1100 };
-      world.step(STEP, driveInput(state, target.x, target.y));
-      if (state.cashDrop) break;
-    }
-    return { screen: SCREEN_PLAY, best: state.cash };
-  }
-  // cover: a three-star getaway east along the Depot road.
   world.reset();
-  world.startMission(2);
-  world.setWanted(3);
-  const car = firstCar(world);
-  car.x = 1500;
-  car.y = 1100;
-  car.angle = 0;
-  seatPlayer(world, car);
-  // 2 s east along the road keeps the getaway mid-city, then coast to a stop;
-  // two cops are placed on the road behind the player so the pursuit is in frame.
-  for (let i = 0; i < 2 / STEP; i += 1) {
-    world.step(STEP, driveInput(state, 2700, 1100));
+  const step = (input) => world.step(STEP, input);
+
+  if (name === 'drive') {
+    // A first ride down the main avenue, a traffic car alongside.
+    const route = [
+      { x: 320, y: 960 },
+      { x: 960, y: 960 },
+      { x: 1600, y: 960 },
+      { x: 2240, y: 960 },
+    ];
+    const index = { value: 0 };
+    for (let i = 0; i < 20 / STEP; i += 1) step(followRoute(state, route, index));
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  for (let i = 0; i < 1.5 / STEP; i += 1) {
-    world.step(STEP, IDLE);
+
+  if (name === 'chase') {
+    // Three stars, two cop cars closing in on a downtown escape.
+    state.wanted = 3;
+    const route = [
+      { x: 640, y: 640 },
+      { x: 1280, y: 640 },
+      { x: 1280, y: 1280 },
+      { x: 640, y: 1280 },
+      { x: 640, y: 640 },
+    ];
+    const index = { value: 0 };
+    // First get the car moving downtown, then let the cops close in.
+    state.playerCar.x = 640;
+    state.playerCar.y = 640;
+    state.playerCar.angle = 0;
+    for (let i = 0; i < 14 / STEP; i += 1) {
+      step(followRoute(state, route, index));
+      // Stop while the car is still alive, so the shot shows a chase, not a wreck.
+      if (state.wrecked || state.busted || state.won || state.playerCar.health < 40) break;
+    }
+    return { screen: SCREEN_PLAY, best: state.cash };
   }
-  const p = state.player;
-  world.placePolice(p.x - 220, p.y, 0);
-  world.placePolice(p.x - 380, p.y + 28, 0);
-  return { screen: SCREEN_PLAY, best: state.cash };
+
+  if (name === 'heist') {
+    // On foot at the pier pickup, the package in hand, the getaway car waiting.
+    const job = JOBS[0];
+    state.playerCar.x = 1280;
+    state.playerCar.y = 1580;
+    state.playerCar.angle = Math.PI / 2;
+    state.playerCar.vx = 0;
+    state.playerCar.vy = 0;
+    state.player.inCar = false;
+    state.player.x = 1280;
+    state.player.y = 1640;
+    state.player.angle = Math.PI / 2;
+    // Walk to the package and grab it, then the frame shows the getaway moment.
+    for (let i = 0; i < 6 / STEP; i += 1) {
+      step(walkTo(state, job.pickup.x, job.pickup.y));
+      if (state.hasPackage) break;
+    }
+    // Step a few more frames so the message banner and the package state settle.
+    for (let i = 0; i < 0.5 / STEP; i += 1) step(noInput());
+    return { screen: SCREEN_PLAY, best: state.cash };
+  }
+
+  // Cover: the title over a downtown night scene — the player's car parked
+  // under neon, traffic rolling past, a cop cruising in the distance.
+  state.playerCar.x = 1280;
+  state.playerCar.y = 960;
+  state.playerCar.angle = 0;
+  state.playerCar.vx = 0;
+  state.playerCar.vy = 0;
+  state.wanted = 1;
+  for (let i = 0; i < 6 / STEP; i += 1) step(noInput());
+  return { screen: SCREEN_TITLE, best: 0 };
 }

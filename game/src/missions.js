@@ -1,74 +1,41 @@
-// The five jobs of Rustline. Each job is a list of objectives the world checks in
-// order; a job pays out when its last objective completes. Objectives:
-//   car    — be inside any car
-//   goto   — reach a point (on foot or in a car) within its radius
-//   pickup — walk over a point on foot
-//   heat   — bring the wanted level down to zero
-//   ram    — smash the armored truck until its integrity hits zero
-//   collect— walk over the cash the truck drops
-import { MISSION_PAY, PLACES } from './config.js';
-
-export const MISSIONS = [
+// The five jobs. Each one is a pickup on foot, then a getaway drive to a
+// drop-off, against a clock. Pay grows with the job number; finishing the
+// fifth retires the driver. Locations are road intersections so a car can
+// always reach them.
+export const JOBS = [
   {
-    name: 'First Ride',
-    intro: 'Marlowe needs wheels. Steal a car and bring it to Rusty.',
-    pay: MISSION_PAY[0],
-    steps: [
-      { type: 'car', label: 'Steal a car' },
-      { type: 'goto', x: PLACES.chopShop.x, y: PLACES.chopShop.y, radius: 70, label: "Reach Rusty's Chop Shop" },
-    ],
+    name: 'Job 1 · The Courier',
+    fixer: 'Fixer: grab the duffel at the pier, lose nobody, bring it to the garage.',
+    pickup: { x: 1280, y: 1696 },
+    drop: { x: 1920, y: 224 },
+    pay: 800,
   },
   {
-    name: 'Dead Drop',
-    intro: 'A package waits at the Rail Yard. Grab it on foot, then drive it to the garage.',
-    pay: MISSION_PAY[1],
-    steps: [
-      { type: 'pickup', x: PLACES.railYard.x, y: PLACES.railYard.y, radius: 48, label: 'Grab the package at the Rail Yard' },
-      { type: 'goto', x: PLACES.garage.x, y: PLACES.garage.y, radius: 70, label: "Deliver to Marlowe's Garage" },
-    ],
+    name: 'Job 2 · Neon Run',
+    fixer: 'Fixer: the package is downtown. Cops are thicker there — stay cool.',
+    pickup: { x: 1280, y: 960 },
+    drop: { x: 320, y: 224 },
+    pay: 1200,
   },
   {
-    name: 'Heat Wave',
-    intro: 'Kade put a price on you. Wanted level 3 — lose the heat.',
-    pay: MISSION_PAY[2],
-    steps: [
-      { type: 'heat', label: 'Lose the heat — get wanted to zero' },
-    ],
+    name: 'Job 3 · Port Heist',
+    fixer: 'Fixer: east port, container row. Grab it and do not stop for anyone.',
+    pickup: { x: 2240, y: 1280 },
+    drop: { x: 640, y: 1600 },
+    pay: 1800,
   },
   {
-    name: 'Night Shift',
-    intro: 'Three drops, two minutes. The meter is running.',
-    pay: MISSION_PAY[3],
-    timed: 120,
-    steps: [
-      { type: 'goto', x: PLACES.deliveries[0].x, y: PLACES.deliveries[0].y, radius: 70, label: 'Drop 1 of 3: Northside' },
-      { type: 'goto', x: PLACES.deliveries[1].x, y: PLACES.deliveries[1].y, radius: 70, label: 'Drop 2 of 3: Foundry' },
-      { type: 'goto', x: PLACES.deliveries[2].x, y: PLACES.deliveries[2].y, radius: 70, label: 'Drop 3 of 3: The Flats' },
-    ],
+    name: 'Job 4 · Cross Town',
+    fixer: 'Fixer: longest run yet. The whole city will be watching — be quick.',
+    pickup: { x: 320, y: 1600 },
+    drop: { x: 2240, y: 320 },
+    pay: 2600,
   },
   {
-    name: 'The Iron Vault',
-    intro: "Kade's armored truck runs the Depot road. Ram it until it stops, grab the cash, get home.",
-    pay: MISSION_PAY[4],
-    steps: [
-      { type: 'ram', label: "Ram the armored truck until it stops" },
-      { type: 'collect', label: 'Grab the cash' },
-      { type: 'goto', x: PLACES.safehouse.x, y: PLACES.safehouse.y, radius: 70, label: 'Reach the Safehouse' },
-    ],
+    name: 'Job 5 · The Big One',
+    fixer: 'Fixer: last job. The penthouse money. Do this clean and you are done.',
+    pickup: { x: 2240, y: 1600 },
+    drop: { x: 1280, y: 224 },
+    pay: 5000,
   },
 ];
-
-export function missionCount() {
-  return MISSIONS.length;
-}
-
-export function missionAt(index) {
-  return MISSIONS[Math.min(index, MISSIONS.length - 1)];
-}
-
-/** The label shown in the HUD for the current objective. */
-export function objectiveLabel(index, step) {
-  const mission = missionAt(index);
-  const objective = mission.steps[Math.min(step, mission.steps.length - 1)];
-  return objective.label;
-}
